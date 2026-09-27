@@ -1,0 +1,54 @@
+# Instala o agente de codificação NESTE repositório.
+# Copie para .github/workflows/coding-agent.yml. É só isto: a lógica fica no repositório do agente.
+#
+# Quem dispara: o assistente, pela API do GitHub
+#   POST /repos/{owner}/{repo}/actions/workflows/coding-agent.yml/dispatches
+# Também dá para disparar à mão em Actions > coding-agent > Run workflow.
+
+name: coding-agent
+# O assistente procura a execução por este nome, que inclui o request_id que ele gerou.
+run-name: coding-agent ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Número da issue com a tarefa
+        required: true
+        type: number
+      request_id:
+        description: Id da solicitação (gerado pelo assistente)
+        required: true
+        type: string
+      base_branch:
+        description: Branch base
+        required: false
+        default: main
+        type: string
+      work_branch:
+        description: Branch que o agente vai criar
+        required: true
+        type: string
+
+# O token do workflow só ganha o que está listado aqui, e só dentro deste repositório.
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+# Nunca dois agentes na mesma branch ao mesmo tempo.
+concurrency:
+  group: coding-agent-${{ inputs.work_branch }}
+
+jobs:
+  agent:
+    uses: CaioMC/coding-agent/.github/workflows/agent.yml@main
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      request_id: ${{ inputs.request_id }}
+      base_branch: ${{ inputs.base_branch }}
+      work_branch: ${{ inputs.work_branch }}
+      model: ${{ vars.CODING_AGENT_MODEL || 'qwen3:4b' }}
+      runner: ${{ vars.CODING_AGENT_RUNNER || 'ubuntu-latest' }}
+    secrets:
+      OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}

@@ -11,14 +11,14 @@
         <relativePath/>
     </parent>
 
-    <groupId>com.empresa.copilotlogistico</groupId>
+    <groupId>com.example.codingagent</groupId>
     <artifactId>agent-runner</artifactId>
     <version>0.1.0-SNAPSHOT</version>
     <name>agent-runner</name>
-    <description>Agente de codificação que roda dentro da pipeline (Spring AI + Ollama/Llama)</description>
+    <description>Agente de codificação que roda dentro do GitHub Actions (Spring AI + Ollama)</description>
 
     <properties>
-        <java.version>17</java.version>
+        <java.version>21</java.version>
         <spring-ai.version>1.1.1</spring-ai.version>
     </properties>
 

@@ -1,238 +1,184 @@
-# Copilot Logístico: agente de codificação via pipeline (MVP da POC)
+# coding-agent: agente de codificação no GitHub Actions
 
-Este repositório transforma um pedido feito ao Copilot Logístico em um pull request.
-O assistente dispara uma pipeline (Azure Pipelines ou GitHub Actions). A pipeline sobe um
-ambiente Docker do projeto, roda um agente Java 17 com Spring AI conectado ao Llama (via Ollama),
-que lê o código, edita, compila e testa em laço. No fim, a pipeline faz commit numa branch nova,
-abre um PR em rascunho e publica um resultado que o assistente usa para responder ao usuário
-com o link do PR, os arquivos alterados e o resultado dos testes.
+Um agente que recebe uma **issue**, trabalha num **container isolado** dentro do GitHub
+Actions e devolve um **pull request em rascunho** para revisão humana. Ele é escrito em
+Java 21 com Spring AI e usa um modelo servido pelo **Ollama**.
 
-## Como funciona
+Quem abre a issue e dispara o agente é o assistente de chat
+[`poc-websocket-demo`](https://github.com/CaioMC/poc-websocket-demo), com o comando
+`/codificar`. Mas o agente não depende dele: qualquer pessoa pode abrir uma issue e rodar o
+workflow à mão.
+
+## Índice
+
+1. [Em uma frase](#1-em-uma-frase)
+2. [Como funciona](#2-como-funciona)
+3. [O laço do agente: como o modelo observa a execução](#3-o-laço-do-agente-como-o-modelo-observa-a-execução)
+4. [O que tem neste repositório](#4-o-que-tem-neste-repositório)
+5. [Instalar o agente em um repositório](#5-instalar-o-agente-em-um-repositório)
+6. [Onde o modelo roda](#6-onde-o-modelo-roda)
+7. [Segurança](#7-segurança)
+8. [Rodar localmente](#8-rodar-localmente)
+9. [O que foi testado](#9-o-que-foi-testado)
+10. [Limitações e próximos passos](#10-limitações-e-próximos-passos)
+
+## 1. Em uma frase
+
+**A issue é a tarefa, o GitHub Actions é o computador, o container é a mesa de trabalho
+isolada e o PR em rascunho é a entrega.** Nenhum servidor próprio para manter e nenhum token
+pessoal com permissão de push.
+
+## 2. Como funciona
+
+Cada repositório que quer usar o agente tem um workflow pequeno
+(`.github/workflows/coding-agent.yml`) que chama o **workflow reutilizável** deste
+repositório (`.github/workflows/agent.yml`). Como é chamado, ele roda no contexto do
+repositório alvo e usa o `GITHUB_TOKEN` daquele repositório.
+
+```mermaid
+flowchart TD
+    D["workflow_dispatch<br/>issue_number, request_id"] --> C["Baixa o repositório alvo<br/>e o código do agente"]
+    C --> I["Lê a issue<br/>gitops.py fetch-issue"]
+    I --> O["Prepara o Ollama<br/>externo ou no próprio runner"]
+    O --> S["Sobe o sandbox Docker<br/>instala dependências e corta a rede"]
+    S --> A["agent-runner<br/>laço pensa, age, observa"]
+    A --> V["Verificação independente<br/>.agent/verify.sh"]
+    V --> P["Commit, push e PR em rascunho<br/>gitops.py publish"]
+    P --> R["Artefato agent-result<br/>result.json, changes.patch, journal.jsonl"]
+```
+
+| Passo | Arquivo | Tem token de escrita? |
+|---|---|---|
+| Ler a issue e comentar "comecei" | `scripts/gitops.py fetch-issue` | Sim |
+| Preparar o modelo | `scripts/setup-ollama.sh` | Não |
+| Preparar o sandbox | `scripts/prepare-sandbox.sh` | Não |
+| **Rodar o agente** | `agent-runner/` | **Não** |
+| Commit, push, PR e comentário na issue | `scripts/gitops.py publish` | Sim |
+
+## 3. O laço do agente: como o modelo observa a execução
+
+O `agent-runner` oferece ferramentas ao modelo com `@Tool` do Spring AI e roda o laço
+**manualmente** (`internalToolExecutionEnabled(false)` + `ToolCallingManager`). Assim
+conseguimos contar as voltas, impor limites e registrar cada passo.
 
 ```mermaid
 sequenceDiagram
-    participant U as Usuário
-    participant A as Copilot Logístico
-    participant P as Pipeline
+    participant L as Modelo (Ollama)
     participant R as agent-runner
     participant C as Container do projeto
-    participant L as Llama (Ollama)
-    U->>A: "Implemente a LOG-123 no repositório app"
-    A->>P: iniciar_codificacao: dispara a pipeline
-    P->>P: Clona o repositório e sobe o container
-    loop Até o modelo chamar finish
-        R->>L: Histórico + ferramentas disponíveis
-        L-->>R: Chama read_file, replace_in_file, run_command...
-        R->>C: Executa o comando no container
-        C-->>R: exit_code e saída (erros, testes)
+    R->>L: tarefa + AGENTS.md + ferramentas
+    loop até o modelo chamar finish
+        L->>R: run_command("mvn -o -q test")
+        R->>C: docker exec, com tempo limite
+        C-->>R: exit_code=1 e o erro do teste
+        R->>L: resultado da ferramenta
+        L->>R: replace_in_file(...) para corrigir
+        R->>C: grava no /workspace (volume)
     end
-    R->>C: Verificação independente (.agent/verify.sh)
-    P->>P: Commit, push da branch agent/... e PR em rascunho
-    A->>P: consultar_codificacao: lê result.json
-    A-->>U: Link do PR, arquivos e resultado dos testes
+    L->>R: finish("done", resumo)
+    R->>C: .agent/verify.sh (verificação própria)
+    R->>R: grava result.json e journal.jsonl
 ```
 
-São três peças, e cada uma tem uma responsabilidade só:
-
-| Peça | Onde roda | O que faz |
-| --- | --- | --- |
-| `assistant-connector/` | Dentro do assistente que vocês já têm | Duas ferramentas novas para o Llama do assistente: `iniciar_codificacao` e `consultar_codificacao` |
-| `pipelines/` | Azure Pipelines ou GitHub Actions | Clona o repositório, prepara o Docker, roda o agente, faz commit, push e PR |
-| `agent-runner/` | Dentro da pipeline | O agente que codifica: o laço de pensar, agir e observar com Spring AI |
-
-### Como o modelo "observa" a execução
-
-Essa é a parte central. O `agent-runner` expõe ferramentas ao Llama com `@Tool` do Spring AI e
-roda o laço manualmente (`internalToolExecutionEnabled(false)` + `ToolCallingManager`), em vez
-de deixar o framework fazer tudo sozinho. Assim conseguimos contar iterações, impor limites e
-registrar cada passo. Uma volta típica:
-
-1. O modelo pede `run_command("mvn -o -q test")`.
-2. O agente executa o comando **dentro do container** com `docker exec` e devolve ao modelo:
-   ```
-   exit_code=1 duracao_ms=8421
-   [ERROR] CalculadoraTest.somaDoisNumeros:14 expected: <5> but was: <-1>
-   ```
-3. Na próxima chamada, o modelo lê essa saída, abre o arquivo com `read_file`, corrige com
-   `replace_in_file` e roda os testes de novo.
-4. Quando vê `exit_code=0`, chama `finish("done", "resumo...")`.
-
-Depois do laço, o agente roda **por conta própria** o `.agent/verify.sh` do repositório. Esse
-resultado vai para o PR, então o revisor não depende do que o modelo afirmou.
-
-Ferramentas disponíveis ao modelo (em `agent-runner/.../tools/CodingTools.java`):
+Ferramentas disponíveis (`tools/CodingTools.java`):
 
 | Ferramenta | Para quê |
-| --- | --- |
+|---|---|
 | `list_files` | Ver a estrutura do projeto |
 | `read_file` | Ler um arquivo com número de linha, inteiro ou por intervalo |
 | `search_code` | Procurar por regex no repositório |
-| `replace_in_file` | Editar um trecho exato (precisa ser único no arquivo) |
+| `replace_in_file` | Editar um trecho exato, que precisa ser único no arquivo |
 | `write_file` | Criar ou reescrever um arquivo |
-| `run_command` | Rodar build, testes e comandos de inspeção no container, com tempo limite |
+| `run_command` | Rodar build, testes e inspeções no container, com tempo limite |
 | `finish` | Encerrar com `done` ou `incomplete` e um resumo para o revisor |
 
-## Estrutura do repositório
+O ponto central é o `run_command`: o modelo nunca executa nada diretamente. Ele pede, o
+agent-runner executa no container e devolve **o código de saída e o final da saída**. É lendo
+isso que o modelo percebe um erro de compilação ou um teste falhando e decide o próximo passo.
+
+Depois do laço, o workflow roda o `.agent/verify.sh` por conta própria. Esse resultado vai
+para a descrição do PR, então o revisor não depende do que o modelo afirmou.
+
+## 4. O que tem neste repositório
 
 ```
-coding-agent-poc/
-├── agent-runner/                 # Spring Boot (sem web), Java 17, Spring AI 1.1 + Ollama
-│   └── src/main/java/.../agent/
-│       ├── AgentRunnerApplication.java   # ponto de entrada da pipeline
+coding-agent/
+├── .github/workflows/agent.yml       # workflow reutilizável (workflow_call)
+├── agent-runner/                     # o agente: Spring Boot sem web, Java 21, Spring AI 1.1 + Ollama
+│   └── src/main/java/com/example/codingagent/
+│       ├── AgentRunnerApplication.java   # ponto de entrada
 │       ├── loop/CodingAgent.java         # o laço do agente
 │       ├── tools/CodingTools.java        # as ferramentas @Tool
+│       ├── task/                         # a tarefa (vinda da issue)
 │       └── core/                         # Workspace, executores local e Docker, diário, resultado
-├── assistant-connector/          # Código para plugar no assistente existente
-│   └── src/main/java/.../codingagent/
-│       ├── CodingAgentTools.java         # @Tool iniciar_codificacao e consultar_codificacao
-│       ├── CodingTaskService.java        # gera id e branch, dispara, interpreta o resultado
-│       └── pipeline/                     # clientes Azure Pipelines e GitHub Actions
-├── pipelines/
-│   ├── azure-pipelines.yml
-│   ├── github/coding-agent.yml
-│   └── scripts/
-│       ├── prepare-sandbox.sh            # sobe o container e corta a rede
-│       └── gitops.py                     # clone, commit, push e PR (fora do alcance do modelo)
-└── target-repo-template/         # O que cada repositório alvo precisa ter
-    ├── AGENTS.md
-    └── .agent/ (Dockerfile, setup.sh, verify.sh)
+├── scripts/
+│   ├── gitops.py                     # fetch-issue e publish (API do GitHub + git)
+│   ├── setup-ollama.sh               # Ollama externo ou instalado no runner
+│   └── prepare-sandbox.sh            # container do projeto, dependências, rede cortada
+└── templates/target-repo/            # o que copiar para cada repositório alvo
+    ├── .github/workflows/coding-agent.yml
+    ├── .agent/ (Dockerfile, setup.sh, verify.sh)
+    └── AGENTS.md
 ```
 
-## Passo a passo no Azure DevOps
+## 5. Instalar o agente em um repositório
 
-### 1. Suba este repositório
+1. **Copie os templates** de `templates/target-repo/` para a raiz do repositório alvo e ajuste:
+   - `.agent/Dockerfile`: imagem com a stack do projeto (precisa ter `bash` e `timeout`);
+   - `.agent/setup.sh`: baixa dependências. Roda **com internet**, antes do agente;
+   - `.agent/verify.sh`: build e testes. Roda **sem internet**, depois do agente;
+   - `AGENTS.md`: comandos exatos, arquitetura, convenções e o que não mexer.
+2. **Libere o Actions para abrir PRs**: *Settings > Actions > General > Workflow
+   permissions*, marque **Read and write permissions** e **Allow GitHub Actions to create
+   and approve pull requests**.
+3. **Opcional**: secret `OLLAMA_BASE_URL` e variáveis `CODING_AGENT_MODEL` e
+   `CODING_AGENT_RUNNER` (ver seção 6).
+4. **Teste à mão**: abra uma issue, depois *Actions > coding-agent > Run workflow*, com o
+   número da issue, um `request_id` qualquer (ex.: `teste1`) e uma branch (ex.:
+   `agent/teste1`). Ao final, confira o PR em rascunho, o comentário na issue e o artefato
+   `agent-result`.
 
-Crie um repositório no Azure Repos (por exemplo `coding-agent`) no **mesmo projeto** dos
-repositórios que o agente vai alterar, e envie este código para ele.
+As linhas `- [ ] ...` no corpo da issue viram **critérios de aceite** para o agente.
 
-### 2. Crie o grupo de variáveis
+O repositório [`poc-websocket-demo`](https://github.com/CaioMC/poc-websocket-demo) já vem
+com esses arquivos e serve de exemplo completo.
 
-Em **Pipelines > Library > + Variable group**, crie `coding-agent` com:
+## 6. Onde o modelo roda
 
-| Variável | Exemplo | Secreta |
-| --- | --- | --- |
-| `OLLAMA_BASE_URL` | `http://ollama.interno:11434` | Sim |
-| `OLLAMA_MODEL` | o modelo que o assistente já usa | Não |
-| `SANDBOX_DEFAULT_IMAGE` | `maven:3.9-eclipse-temurin-17` (opcional) | Não |
+| Opção | Configuração | Observação |
+|---|---|---|
+| Ollama no próprio runner (padrão) | Nenhuma | O workflow instala o Ollama e baixa `qwen3:4b`, com cache entre execuções. Em CPU: lento, bom para demonstrar |
+| Ollama externo | Secret `OLLAMA_BASE_URL` | Um servidor com GPU. Coloque autenticação na frente: o Ollama não tem |
+| Runner na sua máquina | Variável `CODING_AGENT_RUNNER=self-hosted` e secret `OLLAMA_BASE_URL=http://localhost:11434` | Usa seu Ollama e sua GPU. O runner precisa de Docker, Java 21 e Python 3 |
 
-O agente da pipeline precisa alcançar o Ollama. Se o Ollama só existe na rede interna, use um
-pool próprio (Managed DevOps Pools ou agentes self-hosted na mesma rede) no lugar de
-`vmImage: ubuntu-latest`. O Ollama não tem autenticação nativa: não o exponha na internet sem
-um gateway na frente.
+O modelo precisa ter suporte a **tools** no Ollama (ex.: `qwen3`, `llama3.1`). Modelos
+pequenos se perdem em tarefas longas: o agente tenta reorientar o modelo duas vezes antes de
+desistir, e para em `max_iterations` (padrão 30).
 
-### 3. Crie a pipeline
+## 7. Segurança
 
-**Pipelines > New pipeline > Azure Repos Git > coding-agent > Existing YAML file >
-`/pipelines/azure-pipelines.yml`**. Salve sem rodar e anote o `definitionId` que aparece na URL.
+| Risco | Como é tratado |
+|---|---|
+| Código gerado acessar a internet ou vazar dados | A rede do container é desligada depois do `setup.sh` |
+| Modelo usar o token de Git | O token só aparece nos passos do `gitops.py`; o passo do agente não o recebe, e o checkout usa `persist-credentials: false` |
+| Modelo sair do repositório | As ferramentas bloqueiam `../`, links simbólicos para fora e a pasta `.git` |
+| Push direto na main | O agente só cria `agent/...`; o PR nasce em rascunho; proteja a `main` com revisão obrigatória |
+| Laço infinito ou custo alto | Limites de iterações, de chamadas de ferramenta, de tempo por comando e do job (90 min) |
+| Prompt injection na issue ou no código | Regras no prompt de sistema e, principalmente, as barreiras acima |
+| Auditoria | `journal.jsonl` com cada chamada de ferramenta, no artefato `agent-result`, linkado no PR |
 
-### 4. Dê permissões à identidade da pipeline
+## 8. Rodar localmente
 
-A pipeline usa `System.AccessToken`, cuja identidade é
-`<Projeto> Build Service (<organização>)`. Nos repositórios alvo
-(**Project Settings > Repositories > app > Security**), conceda:
-
-- **Contribute**, **Create branch** e **Contribute to pull requests**: Allow.
-- Na branch `main` de cada repositório alvo, negue **Contribute** a essa identidade, para que
-  ela só consiga escrever em branches novas (`agent/...`).
-
-Mantenha as políticas da `main`: revisores obrigatórios e validação por build. O PR do agente
-nasce como rascunho e só entra depois de aprovação humana.
-
-> **Proteção de acesso a repositórios.** Se a configuração *Protect access to repositories in
-> YAML pipelines* estiver ativa no projeto, o token só acessa repositórios declarados no YAML.
-> Isso funciona como uma lista de repositórios permitidos, o que é desejável. Declare-os assim:
->
-> ```yaml
-> resources:
->   repositories:
->     - repository: app
->       type: git
->       name: MeuProjeto/app
-> jobs:
->   - job: code
->     uses:
->       repositories: [app]
-> ```
-
-### 5. Prepare cada repositório alvo
-
-Copie `target-repo-template/` para a raiz do repositório alvo e ajuste:
-
-- `.agent/Dockerfile`: imagem com a stack do projeto (precisa ter `bash` e `timeout`).
-- `.agent/setup.sh`: baixa dependências. Roda **com internet**, antes do agente.
-- `.agent/verify.sh`: verificação final (build e testes). Roda **sem internet**, depois do agente.
-- `AGENTS.md`: comandos exatos, convenções e o que não mexer. O agente lê isso no início.
-
-Sem esses arquivos a pipeline ainda funciona, com a imagem padrão e sem verificação, mas os
-resultados pioram bastante. Esse é o ponto que mais influencia a qualidade, como mostram
-Repo2Run, Devin e Cursor.
-
-### 6. Teste a pipeline manualmente
-
-Rode a pipeline pela interface com parâmetros de teste. Para gerar o `taskB64`:
-
-```bash
-echo -n '{"issueKey":"LOG-1","title":"Criar endpoint GET /health","description":"Retornar {\"status\":\"UP\"}","acceptanceCriteria":["GET /health responde 200"]}' | base64 -w0
-```
-
-Ao final, confira o PR em rascunho e o artefato `agent-result` (`result.json`, `changes.patch`,
-`journal.jsonl`).
-
-## Passo a passo no GitHub Actions
-
-1. Copie `pipelines/github/coding-agent.yml` para `.github/workflows/` deste repositório.
-2. Em **Settings > Secrets and variables > Actions**, crie:
-   - Secrets `OLLAMA_BASE_URL` e `TARGET_REPO_TOKEN` (GitHub App ou PAT fine-grained com
-     *Contents: read and write* e *Pull requests: read and write* nos repositórios alvo).
-   - Variables `OLLAMA_MODEL` e, opcionalmente, `SANDBOX_DEFAULT_IMAGE`.
-3. Proteja a `main` dos repositórios alvo com revisão obrigatória.
-4. Prepare os repositórios alvo como no passo 5 do Azure.
-
-## Integrar ao assistente existente
-
-O conector não depende de nada além de Spring, Spring AI (só as anotações) e Jackson, que o
-assistente já tem.
-
-1. Copie `assistant-connector/src/main/java/com/empresa/copilotlogistico/codingagent` para o
-   projeto do assistente (ou instale como dependência com `mvn install`).
-2. Acrescente a configuração de `assistant-connector/application-coding-agent.example.yml`.
-   Para o Azure, o PAT da conta de serviço precisa só do escopo **Build (Read & Execute)**:
-   quem escreve no repositório é a pipeline, não o assistente.
-3. Registre as ferramentas no `ChatClient` do assistente, junto com as de Jira que vocês já têm
-   (exemplo completo em `assistant-connector/ExemploIntegracao.java.txt`):
-
-   ```java
-   builder.defaultTools(jiraTools, codingAgentTools)
-   ```
-
-Exemplo de conversa:
-
-> **Usuário:** Implementa a LOG-231 no repositório `roteirizador`.
->
-> **Assistente** (chama `iniciar_codificacao`): Comecei a codificação da LOG-231. A branch será
-> `agent/LOG-231-9f3a1c2b` e você pode acompanhar a execução neste link.
->
-> **Usuário:** E aí, terminou?
->
-> **Assistente** (chama `consultar_codificacao`): Terminou. O PR em rascunho está aqui, alterou
-> `RotaService.java` e `RotaServiceTest.java`, e a verificação `mvn -o verify` passou.
-
-`consultar_codificacao` baixa o artefato `agent-result` e devolve ao modelo do assistente o link
-do PR, a lista de arquivos, o resultado da verificação, o resumo do agente e uma prévia do diff.
-É assim que o assistente "oferece os arquivos" ao usuário.
-
-## Rodar o agente localmente (desenvolvimento)
-
-Útil para ajustar prompts e ferramentas sem esperar a pipeline. **Não use o executor local em
-repositórios que você não confia**: ele roda comandos direto na sua máquina.
+Útil para ajustar prompts e ferramentas sem esperar o Actions. Com `executor=local`, os
+comandos rodam na sua máquina: use só em repositórios de confiança.
 
 ```bash
 cd agent-runner && mvn -q package -DskipTests
 cat > /tmp/task.json <<'EOF'
-{"requestId":"dev1","issueKey":"LOG-1","title":"Criar endpoint GET /health",
- "description":"Retornar {\"status\":\"UP\"}","acceptanceCriteria":["GET /health responde 200"]}
+{"requestId":"dev1","issueNumber":1,"title":"Criar endpoint GET /api/health",
+ "description":"Responder {\"status\":\"UP\"}","acceptanceCriteria":["GET /api/health responde 200"]}
 EOF
-OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=<seu-modelo> \
+OLLAMA_BASE_URL=http://localhost:11434 OLLAMA_MODEL=qwen3:4b \
 java -jar target/agent-runner.jar \
   --agent.workspace=/caminho/do/repo-alvo \
   --agent.task-file=/tmp/task.json \
@@ -240,61 +186,33 @@ java -jar target/agent-runner.jar \
   --agent.executor=local
 ```
 
-Para testar o isolamento completo localmente, rode `pipelines/scripts/prepare-sandbox.sh` com
-`WORKSPACE_DIR` e `CONTAINER_NAME` e use `--agent.executor=docker --agent.container=<nome>`.
-Esse também é o caminho para a opção "máquina do usuário": o mesmo agente, com o mesmo executor
-Docker, rodando no computador de quem pediu.
+Para o isolamento completo, rode antes `scripts/prepare-sandbox.sh` com `WORKSPACE_DIR` e
+`CONTAINER_NAME`, e use `--agent.executor=docker --agent.container=<nome>`.
 
-## Segurança: o que fica isolado
+## 9. O que foi testado
 
-| Risco | Como o MVP trata |
-| --- | --- |
-| Código gerado acessar a internet ou exfiltrar dados | Rede do container é desligada depois do `setup.sh` |
-| Modelo usar o token de Git | O token só existe nos passos de clone e publish. O passo do agente não o recebe, e o clone não grava o token no `.git/config` |
-| Modelo sair do repositório | Ferramentas de arquivo bloqueiam `../`, links simbólicos para fora e a pasta `.git` |
-| Push direto na main | Push só para `agent/...`, PR sempre em rascunho, permissão negada na main |
-| Laço infinito ou custo alto | Limite de iterações, de chamadas de ferramenta e de tempo por comando; timeout do job |
-| Prompt injection na issue ou no código | Instruído no prompt de sistema e contido pelas barreiras acima (rede, token, escopo) |
-| Auditoria | `journal.jsonl` com cada chamada de ferramenta, publicado como artefato e linkado no PR |
+Sem acesso ao Maven Central no ambiente em que isto foi escrito:
 
-## O que foi testado e o que falta testar
+- **Núcleo do agente** (arquivos, executor, políticas, diário, resultado): compilado com
+  `javac` e exercitado num projeto Java de verdade, simulando os passos do modelo: ler, buscar,
+  corrigir um bug, compilar, observar `exit_code=0` e um erro, bloquear `git push`, `../` e
+  `.git`, respeitar tempo limite e orçamento.
+- **`gitops.py`** contra um repositório Git local e uma API do GitHub falsa: leitura da issue
+  com critérios de aceite, commit, push, PR em rascunho com `Closes #N`, `[WIP]` quando a
+  verificação falha, comentários na issue e saídas de build fora do commit.
+- **YAML** dos workflows e sintaxe dos scripts.
 
-Testado neste ambiente, sem Maven Central disponível:
+**Não testado aqui**: `mvn package` com as dependências reais do Spring AI (as assinaturas
+usadas em `CodingAgent.java` foram conferidas no código-fonte da versão 1.1.1) e uma execução
+real no GitHub Actions. Esse é o primeiro teste a fazer.
 
-- As classes de núcleo e ferramentas do agente compilam com `javac` (Java 21, alvo compatível
-  com 17). Um teste de fumaça simulou os passos do modelo num projeto Java real: listar, ler,
-  buscar, corrigir um bug, compilar, observar `exit_code=0` e um erro de compilação, bloquear
-  `git push`, `../` e `.git`, respeitar timeout e orçamento, gravar `result.json` e o diário.
-- O conector, de ponta a ponta, contra servidores falsos que imitam as APIs do Azure DevOps e do
-  GitHub: disparo com parâmetros corretos, acompanhamento, download do artefato com redirecionamento
-  sem cabeçalho de autenticação, e a resposta final ao modelo com PR, arquivos, testes e diff.
-- `gitops.py` com um repositório Git local e uma API falsa: clone sem gravar token, sem alterações
-  sem PR, commit e push da branch, PR em rascunho no Azure e no GitHub, `[WIP]` quando a
-  verificação falha, e saídas de build ignoradas no commit.
-- YAMLs válidos e scripts com sintaxe verificada.
+## 10. Limitações e próximos passos
 
-Não testado aqui, e primeiro passo ao clonar:
-
-- `mvn package` dos dois módulos e os testes JUnit. As assinaturas do Spring AI usadas em
-  `CodingAgent.java` foram conferidas no código-fonte da versão 1.1.1, mas a compilação completa
-  com Maven não pôde rodar neste ambiente.
-- Uma execução real com o Llama e com Docker numa pipeline de verdade.
-
-## Limitações conhecidas e próximos passos
-
-- **Modelo.** Agentes de código exigem boa chamada de ferramentas e contexto longo. Modelos
-  pequenos (como Llama 3.1 8B) costumam parar de chamar ferramentas ou repetir ações; o agente
-  tenta reorientar o modelo duas vezes antes de desistir. Meçam a taxa de sucesso com o modelo
-  atual e comparem com um modelo maior ou especializado em código, com suporte a tools no Ollama.
-- **Contexto.** O padrão do Ollama é uma janela pequena; o `application.yml` já define
-  `num-ctx: 32768`. Ajuste conforme a memória do servidor.
-- **Estado do assistente.** O registro das tarefas está em memória. Para produção, persista em
-  banco (requestId, usuário, issue, runId, status).
-- **Aviso de conclusão.** O assistente consulta sob demanda. Um próximo passo é um service hook
-  do Azure DevOps (ou webhook do GitHub) avisando o assistente ao fim da pipeline.
-- **Ajustes pelo PR.** Reexecutar a pipeline passando os comentários do PR como tarefa, sobre a
-  branch existente.
-- **Identidade.** Trocar PAT por service principal ou managed identity do Entra ID; o cliente do
-  Azure já aceita um fornecedor de token (`AzurePipelinesClient.bearer(...)`).
-- **Tempo de preparo.** Publicar a imagem do agent-runner e a imagem de cada projeto num registry,
-  em vez de compilar a cada execução.
+- **PR aberto com `GITHUB_TOKEN` não dispara outros workflows** (regra do GitHub contra
+  loops). Se o repositório tem CI em PRs, use o token de um GitHub App no passo de publicação.
+- **Desempenho no runner padrão.** CPU e modelo pequeno: bom para mostrar o fluxo, não para
+  medir qualidade. Compare com um Ollama com GPU.
+- **Janela de contexto.** O `application.yml` pede `num-ctx: 32768`; o histórico cresce a
+  cada volta. Um próximo passo é resumir o histórico antigo.
+- **Ajustes pelo PR.** Reexecutar o agente sobre a mesma branch a partir de um comentário.
+- **Imagem pronta.** Publicar o agent-runner como imagem no GHCR para não compilar a cada execução.

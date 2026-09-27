@@ -4,14 +4,14 @@ spring:
     banner-mode: off
   ai:
     ollama:
-      # Endpoint do Llama. Na pipeline vem da variável secreta OLLAMA_BASE_URL.
+      # Endpoint do Ollama. No workflow, vem do secret OLLAMA_BASE_URL ou do Ollama iniciado no próprio runner.
       base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
       init:
-        # Não tenta baixar o modelo na pipeline: ele já deve existir no servidor.
+        # Não tenta baixar o modelo no workflow: ele já deve existir no servidor.
         pull-model-strategy: never
       chat:
         options:
-          model: ${OLLAMA_MODEL:llama3.1:8b}
+          model: ${OLLAMA_MODEL:qwen3:4b}
           temperature: 0.1
           # IMPORTANTE: o padrão do Ollama é uma janela de contexto pequena.
           # O agente acumula histórico (arquivos lidos, saídas de testes), então aumente.
@@ -24,16 +24,16 @@ agent:
   executor: ${AGENT_EXECUTOR:docker}
   container: ${AGENT_CONTAINER:agent-sandbox}
   container-workdir: /workspace
-  max-iterations: ${AGENT_MAX_ITERATIONS:40}
-  max-tool-calls: ${AGENT_MAX_TOOL_CALLS:120}
+  max-iterations: ${AGENT_MAX_ITERATIONS:30}
+  max-tool-calls: ${AGENT_MAX_TOOL_CALLS:90}
   command-timeout-seconds: 300
   max-command-timeout-seconds: 1200
   max-output-chars: 6000
   verify-command: ${AGENT_VERIFY_COMMAND:}
   verify-timeout-seconds: 1200
-  model-label: ${OLLAMA_MODEL:llama3.1:8b}
+  model-label: ${OLLAMA_MODEL:qwen3:4b}
 
 logging:
   level:
     root: WARN
-    com.empresa.copilotlogistico: INFO
+    com.example.codingagent: INFO
