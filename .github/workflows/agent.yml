@@ -82,11 +82,16 @@ jobs:
     env:
       TARGET_DIR: ${{ github.workspace }}/target
       AGENT_DIR: ${{ github.workspace }}/agent
-      TASK_FILE: ${{ runner.temp }}/task.json
-      OUTPUT_DIR: ${{ runner.temp }}/agent-result
       CONTAINER_NAME: agent-sandbox-${{ github.run_id }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
+      # O contexto `runner` não existe no env do job, só dentro dos steps; por isso
+      # TASK_FILE e OUTPUT_DIR são definidos aqui, via GITHUB_ENV.
+      - name: Definir caminhos temporários
+        run: |
+          echo "TASK_FILE=$RUNNER_TEMP/task.json" >> "$GITHUB_ENV"
+          echo "OUTPUT_DIR=$RUNNER_TEMP/agent-result" >> "$GITHUB_ENV"
+
       # 1. Código: o repositório alvo (onde o agente vai trabalhar) e o próprio agente.
       - name: Baixar repositório alvo
         uses: actions/checkout@v4
