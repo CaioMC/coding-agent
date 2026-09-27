@@ -1,0 +1,133 @@
+# Pipeline do agente de codificação: Azure Pipelines
+#
+# Não roda por push nem PR. É disparada pela API, pelo Copilot Logístico:
+#   POST {org}/{projeto}/_apis/pipelines/{pipelineId}/runs?api-version=7.1
+#   { "templateParameters": { "requestId": "...", "targetRepository": "...", ... } }
+#
+# Fluxo: compila o agent-runner > clona o repositório alvo > sobe o sandbox Docker >
+#        roda o agente (Llama via Ollama) > commit, push e PR em rascunho > publica o resultado.
+
+trigger: none
+pr: none
+
+parameters:
+  - name: requestId
+    displayName: ID da solicitação (gerado pelo assistente)
+    type: string
+  - name: targetRepository
+    displayName: Repositório alvo (nome no mesmo projeto)
+    type: string
+  - name: baseBranch
+    displayName: Branch base
+    type: string
+    default: main
+  - name: workBranch
+    displayName: Branch que o agente vai criar (ex. agent/LOG-123-ab12cd)
+    type: string
+  - name: taskB64
+    displayName: Tarefa em JSON, codificada em base64
+    type: string
+
+# Troque por um pool próprio (Managed DevOps Pools, por exemplo) se o Ollama ou os
+# pacotes do projeto só forem acessíveis pela rede interna da empresa.
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Grupo de variáveis em Pipelines > Library:
+  #   OLLAMA_BASE_URL (secreta), OLLAMA_MODEL, SANDBOX_DEFAULT_IMAGE (opcional)
+  - group: coding-agent
+  - name: TARGET_DIR
+    value: $(Agent.TempDirectory)/target
+  - name: TASK_FILE
+    value: $(Agent.TempDirectory)/task.json
+  - name: OUTPUT_DIR
+    value: $(Build.ArtifactStagingDirectory)/agent-result
+  - name: CONTAINER_NAME
+    value: agent-sandbox-$(Build.BuildId)
+
+jobs:
+  - job: code
+    displayName: Codificar ${{ parameters.workBranch }}
+    timeoutInMinutes: 90
+    steps:
+      # Repositório deste projeto (agent-runner e scripts). Sem credencial persistida.
+      - checkout: self
+        fetchDepth: 1
+        persistCredentials: false
+
+      - task: Cache@2
+        displayName: Cache do Maven
+        inputs:
+          key: 'maven | "$(Agent.OS)" | agent-runner/pom.xml'
+          path: $(Pipeline.Workspace)/.m2
+
+      - script: |
+          set -e
+          export JAVA_HOME="$(JAVA_HOME_17_X64)"
+          mvn -B -q -Dmaven.repo.local="$(Pipeline.Workspace)/.m2" -f agent-runner/pom.xml package -DskipTests
+        displayName: Compilar agent-runner
+
+      - script: python3 pipelines/scripts/gitops.py decode-task
+        displayName: Ler a tarefa
+        env:
+          TASK_B64: ${{ parameters.taskB64 }}
+          REQUEST_ID: ${{ parameters.requestId }}
+          TASK_FILE: $(TASK_FILE)
+
+      # O token só aparece nos passos que mapeiam System.AccessToken explicitamente.
+      - script: python3 pipelines/scripts/gitops.py clone
+        displayName: Clonar repositório alvo
+        env:
+          GIT_PROVIDER: azure
+          GIT_TOKEN: $(System.AccessToken)
+          TARGET_REPO_URL: $(System.CollectionUri)$(System.TeamProject)/_git/${{ parameters.targetRepository }}
+          BASE_BRANCH: ${{ parameters.baseBranch }}
+          WORKSPACE_DIR: $(TARGET_DIR)
+
+      - script: bash pipelines/scripts/prepare-sandbox.sh
+        displayName: Preparar sandbox Docker
+        env:
+          WORKSPACE_DIR: $(TARGET_DIR)
+          CONTAINER_NAME: $(CONTAINER_NAME)
+          SANDBOX_DEFAULT_IMAGE: $(SANDBOX_DEFAULT_IMAGE)
+
+      # Passo do modelo: SEM token de Git. Só a URL do modelo e o nome do container.
+      - script: |
+          set -e
+          export JAVA_HOME="$(JAVA_HOME_17_X64)"
+          "$JAVA_HOME/bin/java" -jar agent-runner/target/agent-runner.jar
+        displayName: Rodar agente de codificação
+        env:
+          OLLAMA_BASE_URL: $(OLLAMA_BASE_URL)
+          OLLAMA_MODEL: $(OLLAMA_MODEL)
+          AGENT_WORKSPACE: $(TARGET_DIR)
+          AGENT_TASK_FILE: $(TASK_FILE)
+          AGENT_OUTPUT_DIR: $(OUTPUT_DIR)
+          AGENT_EXECUTOR: docker
+          AGENT_CONTAINER: $(CONTAINER_NAME)
+
+      - script: python3 pipelines/scripts/gitops.py publish
+        displayName: Commit, push e PR em rascunho
+        env:
+          GIT_PROVIDER: azure
+          GIT_TOKEN: $(System.AccessToken)
+          ADO_ORG_URL: $(System.CollectionUri)
+          ADO_PROJECT: $(System.TeamProject)
+          TARGET_REPO: ${{ parameters.targetRepository }}
+          WORK_BRANCH: ${{ parameters.workBranch }}
+          BASE_BRANCH: ${{ parameters.baseBranch }}
+          WORKSPACE_DIR: $(TARGET_DIR)
+          OUTPUT_DIR: $(OUTPUT_DIR)
+          TASK_FILE: $(TASK_FILE)
+          RUN_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
+
+      # result.json, changes.patch e journal.jsonl: o assistente lê daqui.
+      - publish: $(OUTPUT_DIR)
+        artifact: agent-result
+        displayName: Publicar resultado
+        condition: always()
+
+      - script: docker rm -f $(CONTAINER_NAME) || true
+        displayName: Remover sandbox
+        condition: always()

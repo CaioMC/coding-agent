@@ -1,0 +1,24 @@
+// Exemplo: como plugar as ferramentas no ChatClient que o assistente já usa.
+// Ajuste nomes de pacote e de bean ao seu projeto.
+
+@Configuration
+class AssistenteChatConfig {
+
+    @Bean
+    ChatClient chatClient(ChatClient.Builder builder,
+                          JiraTools jiraTools,                 // ferramentas que vocês já têm
+                          CodingAgentTools codingAgentTools) { // novas
+        return builder
+                .defaultSystem("""
+                        Você é o Copilot Logístico...
+                        Quando o usuário pedir uma implementação de código:
+                        1. Garanta que existe uma issue bem descrita (crie no Jira se preciso).
+                        2. Confirme com o usuário o repositório e a branch base.
+                        3. Chame iniciar_codificacao e informe o requestId.
+                        4. Quando o usuário perguntar do andamento, chame consultar_codificacao e
+                           mostre o link do PR, os arquivos alterados e o resultado dos testes.
+                        """)
+                .defaultTools(jiraTools, codingAgentTools)
+                .build();
+    }
+}
