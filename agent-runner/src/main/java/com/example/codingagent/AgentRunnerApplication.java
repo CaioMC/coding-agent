@@ -52,25 +52,25 @@ public class AgentRunnerApplication {
     CommandLineRunner runAgent(ChatModel chatModel, AgentProperties props, ExitHolder exit) {
         return args -> {
             Workspace workspace = new Workspace(Path.of(props.getWorkspace()));
-            Path outputDir = Path.of(props.getOutputDir());
             AgentTask task = TaskLoader.load(Path.of(props.getTaskFile()));
+
+            Path outputDir = Path.of(props.getOutputDir());
 
             CommandExecutor executor = "local".equalsIgnoreCase(props.getExecutor())
                     ? new LocalCommandExecutor(workspace, props.getMaxOutputChars())
                     : new DockerCommandExecutor(props.getContainer(), props.getContainerWorkdir(), props.getMaxOutputChars());
 
             ExecutionJournal journal = new ExecutionJournal(outputDir.resolve("journal.jsonl"), props.getMaxToolCalls());
-            CodingTools tools = new CodingTools(workspace, executor, new CommandPolicy(), journal,
-                    props.getCommandTimeoutSeconds(), props.getMaxCommandTimeoutSeconds());
+            CodingTools tools = new CodingTools(workspace, executor, new CommandPolicy(), journal, props.getCommandTimeoutSeconds(), props.getMaxCommandTimeoutSeconds());
 
-            log.info("Issue #{} ({}) no workspace {} usando {}", task.issueNumber(), task.requestId(),
-                    workspace.root(), executor.describe());
+            log.info("Issue #{} ({}) no workspace {} usando {}", task.issueNumber(), task.requestId(), workspace.root(), executor.describe());
 
             AgentResult result = new CodingAgent(chatModel, workspace, executor, journal, tools, props).run(task);
             result.writeTo(outputDir.resolve("result.json"));
 
             log.info("Status: {} | iterações: {} | ferramentas: {}", result.status(), result.iterations(), result.toolCalls());
             log.info("Resumo: {}", result.summary());
+
             exit.code = "ERROR".equals(result.status()) ? 1 : 0;
         };
     }

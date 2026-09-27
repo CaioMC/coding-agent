@@ -20,8 +20,13 @@ public class LocalCommandExecutor implements CommandExecutor {
 
     @Override
     public CommandResult run(String command, Duration timeout) {
-        return ProcessRunner.run(List.of("bash", "-lc", command), workspace.root(),
-                Map.of("CI", "true"), timeout, maxOutputChars);
+        return ProcessRunner.run(
+                List.of("bash", "-lc", command),
+                workspace.root(),
+                Map.of("CI", "true"),
+                timeout,
+                maxOutputChars
+        );
     }
 
     @Override

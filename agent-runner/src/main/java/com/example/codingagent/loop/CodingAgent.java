@@ -65,6 +65,7 @@ public class CodingAgent {
     }
 
     public AgentResult run(AgentTask task) {
+
         ToolCallingManager toolCallingManager = ToolCallingManager.builder().build();
         ToolCallingChatOptions options = ToolCallingChatOptions.builder()
                 .toolCallbacks(ToolCallbacks.from(tools))
@@ -78,26 +79,33 @@ public class CodingAgent {
         int iteration = 0;
         int nudges = 0;
         String endReason;
+
         try {
             while (true) {
                 iteration++;
+
                 if (iteration > props.getMaxIterations()) {
                     endReason = "budget";
                     break;
                 }
+
                 log.info("Iteração {} de {}", iteration, props.getMaxIterations());
+
                 ChatResponse response = chatModel.call(prompt);
                 AssistantMessage output = response.getResult() == null ? null : response.getResult().getOutput();
+
                 journal.log("model_turn", Map.of("iteration", iteration,
                         "text", output == null || output.getText() == null ? "" : output.getText(),
                         "toolCalls", output == null ? 0 : output.getToolCalls().size()));
 
                 if (response.hasToolCalls()) {
                     ToolExecutionResult executed = toolCallingManager.executeToolCalls(prompt, response);
+
                     if (tools.finishSignal() != null || executed.returnDirect()) {
                         endReason = "finish";
                         break;
                     }
+
                     prompt = new Prompt(executed.conversationHistory(), options);
                     continue;
                 }
@@ -108,11 +116,15 @@ public class CodingAgent {
                     endReason = "no_tool_calls";
                     break;
                 }
+
                 nudges++;
+
                 List<Message> next = new ArrayList<>(prompt.getInstructions());
+
                 if (output != null) {
                     next.add(output);
                 }
+
                 next.add(new UserMessage(Prompts.NUDGE_NO_TOOL_CALL));
                 prompt = new Prompt(next, options);
             }
@@ -127,6 +139,7 @@ public class CodingAgent {
         CodingTools.FinishSignal finish = tools.finishSignal();
         String status;
         String summary;
+
         if (finish == null) {
             status = "budget".equals(endReason) ? "BUDGET_EXCEEDED" : "INCOMPLETE";
             summary = "budget".equals(endReason)
@@ -142,6 +155,7 @@ public class CodingAgent {
             status = "COMPLETED";
             summary = finish.summary();
         }
+
         return buildResult(task, status, summary, Math.min(iteration, props.getMaxIterations()), verification);
     }
 
