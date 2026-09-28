@@ -1,18 +1,6 @@
-# Workflow REUTILIZÁVEL do agente de codificação.
-#
-# Ele não é disparado sozinho: cada repositório que quer usar o agente tem um workflow
-# pequeno (templates/target-repo/.github/workflows/coding-agent.yml) que chama este aqui.
-# Por ser chamado, ele roda NO CONTEXTO do repositório alvo: o GITHUB_TOKEN é daquele
-# repositório e expira no fim do job, então não é preciso nenhum token pessoal para push e PR.
-#
-# Etapas:
-#   1. baixa o repositório alvo e o código do agente
-#   2. lê a issue que descreve a tarefa
-#   3. garante um Ollama disponível (externo ou iniciado aqui no runner)
-#   4. sobe o sandbox Docker do projeto e corta a rede dele
-#   5. roda o agente (laço pensa, age, observa)
-#   6. commit, push e PR em rascunho ligado à issue
-#   7. publica result.json, changes.patch e journal.jsonl como artefato
+# Workflow reutilizável do agente de codificação.
+# Cada repositório alvo o chama pelo templates/target-repo/.github/workflows/coding-agent.yml.
+# Passo a passo explicado em docs/pipeline.md.
 
 name: agent
 
@@ -85,21 +73,19 @@ jobs:
       CONTAINER_NAME: agent-sandbox-${{ github.run_id }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      # O contexto `runner` não existe no env do job, só dentro dos steps; por isso
-      # TASK_FILE e OUTPUT_DIR são definidos aqui, via GITHUB_ENV.
+      # O contexto `runner` não existe no env do job, só dentro dos steps.
       - name: Definir caminhos temporários
         run: |
           echo "TASK_FILE=$RUNNER_TEMP/task.json" >> "$GITHUB_ENV"
           echo "OUTPUT_DIR=$RUNNER_TEMP/agent-result" >> "$GITHUB_ENV"
 
-      # 1. Código: o repositório alvo (onde o agente vai trabalhar) e o próprio agente.
       - name: Baixar repositório alvo
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.base_branch }}
           path: target
           fetch-depth: 50
-          persist-credentials: false   # o token NÃO fica no .git/config que o agente enxerga
+          persist-credentials: false   # o token não fica no .git/config que o agente enxerga
 
       - name: Baixar código do agente
         uses: actions/checkout@v4
@@ -109,7 +95,8 @@ jobs:
           path: agent
           persist-credentials: false
 
-      - uses: actions/setup-java@v4
+      - name: Instalar Java 21
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
@@ -119,16 +106,13 @@ jobs:
       - name: Compilar agent-runner
         run: mvn -B -q -f "$AGENT_DIR/agent-runner/pom.xml" package -DskipTests
 
-      # 2. A tarefa é a issue. Também comenta na issue que o trabalho começou.
       - name: Ler a issue
-        run: python3 "$AGENT_DIR/scripts/gitops.py" fetch-issue
+        run: python3 "$AGENT_DIR/scripts/gitops" fetch-issue
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           REQUEST_ID: ${{ inputs.request_id }}
 
-      # 3. Modelo. Com o secret OLLAMA_BASE_URL, usa um Ollama externo (GPU, servidor da empresa).
-      #    Sem ele, instala o Ollama aqui mesmo: é lento (CPU), mas deixa a POC rodando sem infra.
       - name: Cache dos modelos do Ollama
         if: inputs.runner == 'ubuntu-latest'
         uses: actions/cache@v4
@@ -142,14 +126,13 @@ jobs:
           EXTERNAL_OLLAMA_URL: ${{ secrets.OLLAMA_BASE_URL }}
           OLLAMA_MODEL: ${{ inputs.model }}
 
-      # 4. Sandbox: container do projeto, dependências instaladas, rede cortada.
       - name: Preparar sandbox Docker
         run: bash "$AGENT_DIR/scripts/prepare-sandbox.sh"
         env:
           WORKSPACE_DIR: ${{ env.TARGET_DIR }}
           SANDBOX_DEFAULT_IMAGE: ${{ inputs.sandbox_image }}
 
-      # 5. O agente. Repare: este passo NÃO recebe o GITHUB_TOKEN.
+      # Este passo não recebe o GITHUB_TOKEN.
       - name: Rodar agente de codificação
         run: java -jar "$AGENT_DIR/agent-runner/target/agent-runner.jar"
         env:
@@ -161,16 +144,14 @@ jobs:
           AGENT_CONTAINER: ${{ env.CONTAINER_NAME }}
           AGENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
 
-      # 6. Publicação: só aqui o token de escrita aparece.
       - name: Commit, push e PR em rascunho
-        run: python3 "$AGENT_DIR/scripts/gitops.py" publish
+        run: python3 "$AGENT_DIR/scripts/gitops" publish
         env:
           GH_TOKEN: ${{ github.token }}
           WORKSPACE_DIR: ${{ env.TARGET_DIR }}
           WORK_BRANCH: ${{ inputs.work_branch }}
           BASE_BRANCH: ${{ inputs.base_branch }}
 
-      # 7. O assistente baixa este artefato para mostrar o resultado no chat.
       - name: Publicar resultado
         if: always()
         uses: actions/upload-artifact@v4

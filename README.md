@@ -1,176 +1,187 @@
-# coding-agent: agente de codificação no GitHub Actions
+# coding-agent
 
-Um agente que recebe uma **issue**, trabalha num **container isolado** dentro do GitHub
-Actions e devolve um **pull request em rascunho** para revisão humana. Ele é escrito em
-Java 21 com Spring AI e usa um modelo servido pelo **Ollama**.
+Um agente de codificação que recebe uma **issue**, trabalha num **container isolado** dentro
+do GitHub Actions e devolve um **pull request em rascunho** para revisão humana.
 
-Quem abre a issue e dispara o agente é o assistente de chat
-[`poc-websocket-demo`](https://github.com/CaioMC/poc-websocket-demo), com o comando
-`/codificar`. Mas o agente não depende dele: qualquer pessoa pode abrir uma issue e rodar o
-workflow à mão.
+Eu construí este projeto para estudar, na prática, como um agente de código funciona por
+dentro: como o modelo "enxerga" o resultado de um comando, como impedir que ele faça o que
+não deve e como transformar isso numa pipeline que qualquer repositório pode usar. Ele é
+escrito em Java 21 com Spring AI, usa um modelo servido pelo **Ollama**, e o código está
+organizado em Clean Architecture.
 
 ## Índice
 
 1. [Em uma frase](#1-em-uma-frase)
-2. [Como funciona](#2-como-funciona)
-3. [O laço do agente: como o modelo observa a execução](#3-o-laço-do-agente-como-o-modelo-observa-a-execução)
+2. [Como as peças se encaixam](#2-como-as-peças-se-encaixam)
+3. [Guia de leitura](#3-guia-de-leitura)
 4. [O que tem neste repositório](#4-o-que-tem-neste-repositório)
 5. [Instalar o agente em um repositório](#5-instalar-o-agente-em-um-repositório)
 6. [Onde o modelo roda](#6-onde-o-modelo-roda)
 7. [Segurança](#7-segurança)
-8. [Rodar localmente](#8-rodar-localmente)
-9. [O que foi testado](#9-o-que-foi-testado)
+8. [Rodar e testar localmente](#8-rodar-e-testar-localmente)
+9. [Problemas que eu já encontrei](#9-problemas-que-eu-já-encontrei)
 10. [Limitações e próximos passos](#10-limitações-e-próximos-passos)
 
 ## 1. Em uma frase
 
 **A issue é a tarefa, o GitHub Actions é o computador, o container é a mesa de trabalho
-isolada e o PR em rascunho é a entrega.** Nenhum servidor próprio para manter e nenhum token
-pessoal com permissão de push.
+isolada e o PR em rascunho é a entrega.**
 
-## 2. Como funciona
+Não há servidor próprio para manter, nem token pessoal com permissão de push.
 
-Cada repositório que quer usar o agente tem um workflow pequeno
-(`.github/workflows/coding-agent.yml`) que chama o **workflow reutilizável** deste
-repositório (`.github/workflows/agent.yml`). Como é chamado, ele roda no contexto do
-repositório alvo e usa o `GITHUB_TOKEN` daquele repositório.
+## 2. Como as peças se encaixam
 
 ```mermaid
-flowchart TD
-    D["workflow_dispatch<br/>issue_number, request_id"] --> C["Baixa o repositório alvo<br/>e o código do agente"]
-    C --> I["Lê a issue<br/>gitops.py fetch-issue"]
-    I --> O["Prepara o Ollama<br/>externo ou no próprio runner"]
-    O --> S["Sobe o sandbox Docker<br/>instala dependências e corta a rede"]
-    S --> A["agent-runner<br/>laço pensa, age, observa"]
-    A --> V["Verificação independente<br/>.agent/verify.sh"]
-    V --> P["Commit, push e PR em rascunho<br/>gitops.py publish"]
-    P --> R["Artefato agent-result<br/>result.json, changes.patch, journal.jsonl"]
-```
-
-| Passo | Arquivo | Tem token de escrita? |
-|---|---|---|
-| Ler a issue e comentar "comecei" | `scripts/gitops.py fetch-issue` | Sim |
-| Preparar o modelo | `scripts/setup-ollama.sh` | Não |
-| Preparar o sandbox | `scripts/prepare-sandbox.sh` | Não |
-| **Rodar o agente** | `agent-runner/` | **Não** |
-| Commit, push, PR e comentário na issue | `scripts/gitops.py publish` | Sim |
-
-## 3. O laço do agente: como o modelo observa a execução
-
-O `agent-runner` oferece ferramentas ao modelo com `@Tool` do Spring AI e roda o laço
-**manualmente** (`internalToolExecutionEnabled(false)` + `ToolCallingManager`). Assim
-conseguimos contar as voltas, impor limites e registrar cada passo.
-
-```mermaid
-sequenceDiagram
-    participant L as Modelo (Ollama)
-    participant R as agent-runner
-    participant C as Container do projeto
-    R->>L: tarefa + AGENTS.md + ferramentas
-    loop até o modelo chamar finish
-        L->>R: run_command("mvn -o -q test")
-        R->>C: docker exec, com tempo limite
-        C-->>R: exit_code=1 e o erro do teste
-        R->>L: resultado da ferramenta
-        L->>R: replace_in_file(...) para corrigir
-        R->>C: grava no /workspace (volume)
+flowchart LR
+    subgraph GH["GitHub (repositório alvo)"]
+        I["Issue<br/>a tarefa"]
+        PR["PR em rascunho<br/>a entrega"]
     end
-    L->>R: finish("done", resumo)
-    R->>C: .agent/verify.sh (verificação própria)
-    R->>R: grava result.json e journal.jsonl
+
+    subgraph RUN["Runner do GitHub Actions"]
+        G1["gitops fetch-issue<br/>(tem token)"]
+        AR["agent-runner<br/>(sem token)"]
+        G2["gitops publish<br/>(tem token)"]
+        subgraph C["Container sem rede"]
+            REPO["/workspace<br/>o código do projeto"]
+        end
+    end
+
+    OL["Ollama<br/>o modelo"]
+
+    I -->|"lê"| G1
+    G1 -->|"task.json"| AR
+    AR <-->|"prompt e tool calls"| OL
+    AR -->|"docker exec<br/>build, testes"| C
+    AR -->|"result.json"| G2
+    G2 -->|"commit, push, PR"| PR
 ```
 
-Ferramentas disponíveis (`tools/CodingTools.java`):
+O ciclo do agente é **pensa, age, observa**:
 
-| Ferramenta | Para quê |
+1. o modelo recebe a tarefa e a lista de ferramentas (`read_file`, `run_command`...);
+2. ele pede uma ferramenta, por exemplo `run_command("mvn -o -q test")`;
+3. o agent-runner executa no container e devolve `exit_code=1` com o erro do teste;
+4. o modelo lê o erro, corrige o arquivo e roda o teste de novo;
+5. quando termina, chama `finish` com um resumo.
+
+Depois disso, a pipeline roda a verificação do projeto por conta própria. Assim, o revisor
+do PR não depende do que o modelo afirmou.
+
+## 3. Guia de leitura
+
+Eu separei a documentação por pergunta. Comece pelo que você quer entender:
+
+| Quero entender... | Leia |
 |---|---|
-| `list_files` | Ver a estrutura do projeto |
-| `read_file` | Ler um arquivo com número de linha, inteiro ou por intervalo |
-| `search_code` | Procurar por regex no repositório |
-| `replace_in_file` | Editar um trecho exato, que precisa ser único no arquivo |
-| `write_file` | Criar ou reescrever um arquivo |
-| `run_command` | Rodar build, testes e inspeções no container, com tempo limite |
-| `finish` | Encerrar com `done` ou `incomplete` e um resumo para o revisor |
+| O que cada step da pipeline faz, e como | [docs/pipeline.md](docs/pipeline.md) |
+| Quem conversa com quem, em cada cenário (sucesso, erro, bloqueio, limite...) | [docs/sequencias.md](docs/sequencias.md) |
+| Em que estado cada coisa está e o que a faz mudar | [docs/estados.md](docs/estados.md) |
+| Como o código Java está organizado (camadas, classes, como estender) | [docs/arquitetura-java.md](docs/arquitetura-java.md) |
+| O que o Python faz (classes, métodos, fluxos) | [docs/gitops-python.md](docs/gitops-python.md) |
 
-O ponto central é o `run_command`: o modelo nunca executa nada diretamente. Ele pede, o
-agent-runner executa no container e devolve **o código de saída e o final da saída**. É lendo
-isso que o modelo percebe um erro de compilação ou um teste falhando e decide o próximo passo.
-
-Depois do laço, o workflow roda o `.agent/verify.sh` por conta própria. Esse resultado vai
-para a descrição do PR, então o revisor não depende do que o modelo afirmou.
+Os diagramas são em [Mermaid](https://mermaid.js.org/), e o GitHub os renderiza direto na
+página.
 
 ## 4. O que tem neste repositório
 
 ```
 coding-agent/
-├── .github/workflows/agent.yml       # workflow reutilizável (workflow_call)
-├── agent-runner/                     # o agente: Spring Boot sem web, Java 21, Spring AI 1.1 + Ollama
+├── .github/workflows/agent.yml        # a pipeline (workflow reutilizável)
+├── agent-runner/                      # o agente, em Java 21 + Spring AI
 │   └── src/main/java/com/example/codingagent/
-│       ├── AgentRunnerApplication.java   # ponto de entrada
-│       ├── loop/CodingAgent.java         # o laço do agente
-│       ├── tools/CodingTools.java        # as ferramentas @Tool
-│       ├── task/                         # a tarefa (vinda da issue)
-│       └── core/                         # Workspace, executores local e Docker, diário, resultado
+│       ├── domain/                    #   regras puras: status final, política de comandos, orçamento
+│       ├── application/               #   o caso de uso e as portas (interfaces)
+│       └── infrastructure/            #   Spring AI, Docker, arquivos, JSON, configuração
 ├── scripts/
-│   ├── gitops.py                     # fetch-issue e publish (API do GitHub + git)
-│   ├── setup-ollama.sh               # Ollama externo ou instalado no runner
-│   └── prepare-sandbox.sh            # container do projeto, dependências, rede cortada
-└── templates/target-repo/            # o que copiar para cada repositório alvo
-    ├── .github/workflows/coding-agent.yml
-    ├── .agent/ (Dockerfile, setup.sh, verify.sh)
-    └── AGENTS.md
+│   ├── gitops/                        # operações de GitHub com token (Python, só biblioteca padrão)
+│   ├── tests/                         # testes do gitops
+│   ├── setup-ollama.sh                # Ollama externo ou instalado no runner
+│   └── prepare-sandbox.sh             # container do projeto, dependências, rede cortada
+├── templates/target-repo/             # o que copiar para cada repositório alvo
+│   ├── .github/workflows/coding-agent.yml
+│   ├── .agent/ (Dockerfile, setup.sh, verify.sh)
+│   └── AGENTS.md
+└── docs/                              # a documentação com os diagramas
 ```
 
 ## 5. Instalar o agente em um repositório
 
 1. **Copie os templates** de `templates/target-repo/` para a raiz do repositório alvo e ajuste:
-   - `.agent/Dockerfile`: imagem com a stack do projeto (precisa ter `bash` e `timeout`);
-   - `.agent/setup.sh`: baixa dependências. Roda **com internet**, antes do agente;
-   - `.agent/verify.sh`: build e testes. Roda **sem internet**, depois do agente;
-   - `AGENTS.md`: comandos exatos, arquitetura, convenções e o que não mexer.
-2. **Libere o Actions para abrir PRs**: *Settings > Actions > General > Workflow
-   permissions*, marque **Read and write permissions** e **Allow GitHub Actions to create
-   and approve pull requests**.
-3. **Opcional**: secret `OLLAMA_BASE_URL` e variáveis `CODING_AGENT_MODEL` e
-   `CODING_AGENT_RUNNER` (ver seção 6).
-4. **Teste à mão**: abra uma issue, depois *Actions > coding-agent > Run workflow*, com o
-   número da issue, um `request_id` qualquer (ex.: `teste1`) e uma branch (ex.:
-   `agent/teste1`). Ao final, confira o PR em rascunho, o comentário na issue e o artefato
+
+   | Arquivo | Para quê | Quando roda |
+   |---|---|---|
+   | `.github/workflows/coding-agent.yml` | O gatilho que chama a pipeline deste repositório | No dispatch |
+   | `.agent/Dockerfile` | A imagem com a stack do projeto (precisa ter `bash` e `timeout`) | Step 8 |
+   | `.agent/setup.sh` | Baixa as dependências | Step 8, **com** internet |
+   | `.agent/verify.sh` | Build e testes, a verificação independente | Step 9, **sem** internet |
+   | `AGENTS.md` | Instruções para o agente: comandos exatos, convenções, o que não mexer | Vai no prompt |
+
+2. **Libere o Actions para abrir PRs** no repositório alvo: *Settings → Actions → General →
+   Workflow permissions*, marque **Allow GitHub Actions to create and approve pull requests**.
+   Sem isso, o push funciona, mas o PR falha com `HTTP 403`.
+
+3. **Opcional:** secret `OLLAMA_BASE_URL` e variáveis `CODING_AGENT_MODEL` e
+   `CODING_AGENT_RUNNER` (veja a seção 6).
+
+4. **Teste à mão:** abra uma issue e depois vá em *Actions → coding-agent → Run workflow*,
+   com o número da issue, um `request_id` qualquer (ex.: `teste1`) e uma branch (ex.:
+   `agent/teste1`). No fim, confira o PR em rascunho, o comentário na issue e o artefato
    `agent-result`.
 
-As linhas `- [ ] ...` no corpo da issue viram **critérios de aceite** para o agente.
+Dica: escreva os critérios de aceite na issue como caixinhas (`- [ ] responde 200 em
+/api/health`). Elas viram uma lista objetiva no prompt do agente.
 
-O repositório [`poc-websocket-demo`](https://github.com/CaioMC/poc-websocket-demo) já vem
-com esses arquivos e serve de exemplo completo.
+O repositório [`poc-websocket-demo`](https://github.com/CaioMC/poc-websocket-demo) já tem
+esses arquivos e serve de exemplo completo.
 
 ## 6. Onde o modelo roda
 
-| Opção | Configuração | Observação |
+| Opção | Configuração | Quando usar |
 |---|---|---|
-| Ollama no próprio runner (padrão) | Nenhuma | O workflow instala o Ollama e baixa `qwen3:4b`, com cache entre execuções. Em CPU: lento, bom para demonstrar |
-| Ollama externo | Secret `OLLAMA_BASE_URL` | Um servidor com GPU. Coloque autenticação na frente: o Ollama não tem |
-| Runner na sua máquina | Variável `CODING_AGENT_RUNNER=self-hosted` e secret `OLLAMA_BASE_URL=http://localhost:11434` | Usa seu Ollama e sua GPU. O runner precisa de Docker, Java 21 e Python 3 |
+| Ollama no próprio runner (padrão) | Nenhuma | Para demonstrar. Roda em **CPU**: cada resposta pode levar minutos |
+| Ollama externo | Secret `OLLAMA_BASE_URL` | Uso real, com um servidor com GPU. Coloque autenticação na frente: o Ollama não tem |
+| Runner na sua máquina | Variável `CODING_AGENT_RUNNER=self-hosted` e secret `OLLAMA_BASE_URL=http://localhost:11434` | Usar a sua GPU. A máquina precisa de Docker, Java 21 e Python 3 |
 
-O modelo precisa ter suporte a **tools** no Ollama (ex.: `qwen3`, `llama3.1`). Modelos
-pequenos se perdem em tarefas longas: o agente tenta reorientar o modelo duas vezes antes de
-desistir, e para em `max_iterations` (padrão 30).
+O modelo precisa suportar **tools** no Ollama (ex.: `qwen3`, `llama3.1`). O padrão é
+`qwen3:4b`. Modelos pequenos se perdem em tarefas longas: o agente dá dois lembretes quando o
+modelo para de usar ferramentas e para em `max_iterations` (padrão 30).
 
 ## 7. Segurança
+
+A ideia central é: **quem conversa com o modelo não tem credencial, e quem tem credencial não
+conversa com o modelo.**
 
 | Risco | Como é tratado |
 |---|---|
 | Código gerado acessar a internet ou vazar dados | A rede do container é desligada depois do `setup.sh` |
-| Modelo usar o token de Git | O token só aparece nos passos do `gitops.py`; o passo do agente não o recebe, e o checkout usa `persist-credentials: false` |
-| Modelo sair do repositório | As ferramentas bloqueiam `../`, links simbólicos para fora e a pasta `.git` |
-| Push direto na main | O agente só cria `agent/...`; o PR nasce em rascunho; proteja a `main` com revisão obrigatória |
+| Modelo usar o token de Git | O token só aparece nos steps do `gitops`. O step do agente não o recebe, e o checkout usa `persist-credentials: false` |
+| Modelo sair do repositório | O `SafePathResolver` barra `../`, links simbólicos para fora e a pasta `.git` |
+| Modelo tentar fazer o papel da pipeline | A `CommandPolicy` bloqueia `git push`, `git commit`, `sudo` etc., com uma mensagem clara |
+| Push direto na `main` | O agente só cria `agent/...` e o PR nasce em rascunho. Proteja a `main` com revisão obrigatória |
 | Laço infinito ou custo alto | Limites de iterações, de chamadas de ferramenta, de tempo por comando e do job (90 min) |
 | Prompt injection na issue ou no código | Regras no prompt de sistema e, principalmente, as barreiras acima |
-| Auditoria | `journal.jsonl` com cada chamada de ferramenta, no artefato `agent-result`, linkado no PR |
+| Auditoria | `journal.jsonl` com cada chamada de ferramenta, no artefato `agent-result` |
 
-## 8. Rodar localmente
+## 8. Rodar e testar localmente
+
+### Testes
+
+```bash
+# Java: domínio, caso de uso, laço com modelo falso, barreiras de arquivo
+cd agent-runner && mvn test
+
+# Python: gitops contra uma API do GitHub falsa e um repositório Git real
+python3 -m unittest discover -s scripts/tests -v
+
+# Workflows: pega erros como contexto inválido antes do push
+docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:latest
+```
+
+### Rodar o agente na sua máquina
 
 Útil para ajustar prompts e ferramentas sem esperar o Actions. Com `executor=local`, os
-comandos rodam na sua máquina: use só em repositórios de confiança.
+comandos rodam direto na sua máquina: use só em repositórios de confiança.
 
 ```bash
 cd agent-runner && mvn -q package -DskipTests
@@ -186,33 +197,44 @@ java -jar target/agent-runner.jar \
   --agent.executor=local
 ```
 
-Para o isolamento completo, rode antes `scripts/prepare-sandbox.sh` com `WORKSPACE_DIR` e
-`CONTAINER_NAME`, e use `--agent.executor=docker --agent.container=<nome>`.
+Para ter o isolamento completo, rode antes o `scripts/prepare-sandbox.sh` com `WORKSPACE_DIR`
+e `CONTAINER_NAME`, e use `--agent.executor=docker --agent.container=<nome>`.
 
-## 9. O que foi testado
+## 9. Problemas que eu já encontrei
 
-Sem acesso ao Maven Central no ambiente em que isto foi escrito:
+### `HTTP 422 ... Unrecognized named-value: 'runner'` ao disparar
 
-- **Núcleo do agente** (arquivos, executor, políticas, diário, resultado): compilado com
-  `javac` e exercitado num projeto Java de verdade, simulando os passos do modelo: ler, buscar,
-  corrigir um bug, compilar, observar `exit_code=0` e um erro, bloquear `git push`, `../` e
-  `.git`, respeitar tempo limite e orçamento.
-- **`gitops.py`** contra um repositório Git local e uma API do GitHub falsa: leitura da issue
-  com critérios de aceite, commit, push, PR em rascunho com `Closes #N`, `[WIP]` quando a
-  verificação falha, comentários na issue e saídas de build fora do commit.
-- **YAML** dos workflows e sintaxe dos scripts.
+O GitHub recusou o workflow antes de rodar qualquer coisa. Eu tinha usado `${{ runner.temp }}`
+no `env:` do job, mas o contexto `runner` só existe dentro dos steps. Corrigi definindo os
+caminhos num step, via `$GITHUB_ENV` (step 0 em [docs/pipeline.md](docs/pipeline.md)).
+O `actionlint` pega esse tipo de erro na hora.
 
-**Não testado aqui**: `mvn package` com as dependências reais do Spring AI (as assinaturas
-usadas em `CodingAgent.java` foram conferidas no código-fonte da versão 1.1.1) e uma execução
-real no GitHub Actions. Esse é o primeiro teste a fazer.
+### A execução parece travada em "Iteração 1 de 30"
+
+Quase sempre não está travada: é o modelo pensando **em CPU**. O primeiro prompt é grande
+(instruções, `AGENTS.md`, a issue e a descrição das sete ferramentas), o `qwen3` gera um
+raciocínio longo antes de responder, e o log só mostra algo quando a resposta chega. Cada
+iteração pode levar vários minutos no `ubuntu-latest`. Para acelerar, use um Ollama com GPU
+(seção 6).
+
+Se o Ollama estiver realmente fora do ar, o Spring AI tenta de novo várias vezes, esperando
+cada vez mais, antes de desistir com status `ERROR`.
+
+### `HTTP 403 ... GitHub Actions is not permitted to create or approve pull requests`
+
+O agente terminou, o push da branch funcionou, mas o GitHub não deixou o `GITHUB_TOKEN` abrir
+o PR. Habilite a opção do item 2 da seção 5 no repositório alvo. Para não perder a execução,
+abra o PR à mão a partir da branch `agent/...`, que já está no GitHub.
 
 ## 10. Limitações e próximos passos
 
-- **PR aberto com `GITHUB_TOKEN` não dispara outros workflows** (regra do GitHub contra
-  loops). Se o repositório tem CI em PRs, use o token de um GitHub App no passo de publicação.
-- **Desempenho no runner padrão.** CPU e modelo pequeno: bom para mostrar o fluxo, não para
-  medir qualidade. Compare com um Ollama com GPU.
-- **Janela de contexto.** O `application.yml` pede `num-ctx: 32768`; o histórico cresce a
-  cada volta. Um próximo passo é resumir o histórico antigo.
-- **Ajustes pelo PR.** Reexecutar o agente sobre a mesma branch a partir de um comentário.
-- **Imagem pronta.** Publicar o agent-runner como imagem no GHCR para não compilar a cada execução.
+- **Falhas silenciosas na issue.** Se o agente termina com `ERROR` ou o PR é recusado, a issue
+  fica só com o comentário "comecei". O motivo está no log e no artefato.
+- **PR aberto com `GITHUB_TOKEN` não dispara outros workflows** (regra do GitHub contra loops).
+  Se o repositório tem CI em PRs, use o token de um GitHub App no step de publicação.
+- **Desempenho no runner padrão.** CPU e modelo pequeno servem para mostrar o fluxo, não para
+  medir qualidade.
+- **Janela de contexto.** O histórico cresce a cada volta, e o `num-ctx` padrão é 32768.
+  Um próximo passo é resumir o histórico antigo.
+- **Ajustes pelo PR.** Rodar o agente de novo sobre a mesma branch a partir de um comentário.
+- **Imagem pronta.** Publicar o agent-runner no GHCR para não compilar a cada execução.
